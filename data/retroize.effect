@@ -1,0 +1,133 @@
+// obs-retroize: pixelize + palette/depth quantization
+// Copyright (c) 2026 Bailey 'monokrome' Stoner
+// SPDX-License-Identifier: BSD-2-Clause
+
+uniform float4x4 ViewProj;
+uniform texture2d image;
+uniform texture2d nes_palette;   // 64x1 RGBA, populated from C
+uniform texture2d bayer;         // 4x4 R8 (read .r), populated from C
+
+uniform float2 source_size;
+uniform float2 target_size;
+uniform float  bits_per_channel;
+uniform float  dither_strength;
+uniform float  nes_count;        // 54.0 -- unique entries to consider
+
+sampler_state pointClamp {
+    Filter   = Point;
+    AddressU = Clamp;
+    AddressV = Clamp;
+};
+
+sampler_state pointWrap {
+    Filter   = Point;
+    AddressU = Wrap;
+    AddressV = Wrap;
+};
+
+struct VertInOut {
+    float4 pos : POSITION;
+    float2 uv  : TEXCOORD0;
+};
+
+VertInOut VSDefault(VertInOut v_in)
+{
+    VertInOut v;
+    v.pos = mul(float4(v_in.pos.xyz, 1.0), ViewProj);
+    v.uv  = v_in.uv;
+    return v;
+}
+
+float2 block_uv()
+{
+    float scale = max(source_size.x / target_size.x,
+                      source_size.y / target_size.y);
+    return float2(scale, scale) / source_size;
+}
+
+float2 snap_uv(float2 uv)
+{
+    float2 b = block_uv();
+    return (floor(uv / b) + 0.5) * b;
+}
+
+float dither_offset(float2 uv)
+{
+    if (dither_strength < 0.5) return 0.0;
+    float2 cell = floor(uv / block_uv());
+    float2 buv = (cell + 0.5) * (1.0 / 4.0);
+    return bayer.Sample(pointWrap, buv).r - 0.5;
+}
+
+float3 quantize_uniform(float3 c, float levels, float d)
+{
+    float divisor = max(levels - 1.0, 1.0);
+    return floor(saturate(c + d / levels) * (levels - 1.0) + 0.5) / divisor;
+}
+
+float3 sample_pixelated(float2 uv)
+{
+    return image.Sample(pointClamp, snap_uv(uv)).rgb;
+}
+
+float3 nearest_nes(float3 c)
+{
+    float3 best = float3(0.0, 0.0, 0.0);
+    float best_d = 1e9;
+    int n = int(nes_count);
+    for (int i = 0; i < 64; i++) {
+        if (i >= n) break;
+        float u = (float(i) + 0.5) / 64.0;
+        float3 p = nes_palette.Sample(pointClamp, float2(u, 0.5)).rgb;
+        float3 d = p - c;
+        float dd = dot(d, d);
+        if (dd < best_d) { best_d = dd; best = p; }
+    }
+    return best;
+}
+
+float3 nearest_gameboy(float lum)
+{
+    if (lum < 0.25) return float3(0.059, 0.220, 0.059);
+    if (lum < 0.50) return float3(0.188, 0.384, 0.188);
+    if (lum < 0.75) return float3(0.545, 0.675, 0.059);
+    return float3(0.612, 0.725, 0.086);
+}
+
+float4 PS_NES(VertInOut v_in) : TARGET
+{
+    return float4(nearest_nes(sample_pixelated(v_in.uv)), 1.0);
+}
+
+float4 PS_SNES(VertInOut v_in) : TARGET
+{
+    float3 c = sample_pixelated(v_in.uv);
+    return float4(quantize_uniform(c, 32.0, dither_offset(v_in.uv)), 1.0);
+}
+
+float4 PS_Genesis(VertInOut v_in) : TARGET
+{
+    float3 c = sample_pixelated(v_in.uv);
+    return float4(quantize_uniform(c, 8.0, dither_offset(v_in.uv)), 1.0);
+}
+
+float4 PS_GameBoy(VertInOut v_in) : TARGET
+{
+    float3 c = sample_pixelated(v_in.uv);
+    float lum = dot(c, float3(0.299, 0.587, 0.114));
+    lum = saturate(lum + dither_offset(v_in.uv) * 0.25);
+    return float4(nearest_gameboy(lum), 1.0);
+}
+
+float4 PS_Custom(VertInOut v_in) : TARGET
+{
+    float3 c = sample_pixelated(v_in.uv);
+    float levels = pow(2.0, bits_per_channel);
+    return float4(quantize_uniform(c, levels, dither_offset(v_in.uv)), 1.0);
+}
+
+technique NES     { pass { vertex_shader = VSDefault(v_in); pixel_shader = PS_NES(v_in); } }
+technique SNES    { pass { vertex_shader = VSDefault(v_in); pixel_shader = PS_SNES(v_in); } }
+technique Genesis { pass { vertex_shader = VSDefault(v_in); pixel_shader = PS_Genesis(v_in); } }
+technique GameBoy { pass { vertex_shader = VSDefault(v_in); pixel_shader = PS_GameBoy(v_in); } }
+technique Custom  { pass { vertex_shader = VSDefault(v_in); pixel_shader = PS_Custom(v_in); } }
