@@ -8,12 +8,32 @@ on:
     branches: [main]
   workflow_dispatch:
 
+permissions:
+  contents: write
+
 jobs:
   windows:
     name: Windows x64
     runs-on: windows-2022
     steps:
       - uses: actions/checkout@v4
+
+      - name: Compute version
+        id: ver
+        shell: pwsh
+        run: |
+          if ($env:GITHUB_REF -like 'refs/tags/v*') {
+            $version = $env:GITHUB_REF -replace '^refs/tags/v', ''
+            $tag = $env:GITHUB_REF -replace '^refs/tags/', ''
+          } else {
+            $stamp = (Get-Date -AsUTC -Format 'yyyy.MM.dd-HHmm')
+            $sha = $env:GITHUB_SHA.Substring(0, 7)
+            $version = "$stamp-$sha"
+            $tag = "v$version"
+          }
+          "version=$version" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          "tag=$tag" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          Write-Host "version=$version  tag=$tag"
 
       - name: Configure
         run: cmake --preset windows-x64
@@ -24,7 +44,7 @@ jobs:
       - name: Stage package
         shell: pwsh
         run: |
-          $version = (Get-Content buildspec.json | ConvertFrom-Json).version
+          $version = '${{ steps.ver.outputs.version }}'
           $stage = "package/retroize"
           New-Item -ItemType Directory -Force -Path "$stage/bin/64bit" | Out-Null
           New-Item -ItemType Directory -Force -Path "$stage/data" | Out-Null
@@ -40,9 +60,13 @@ jobs:
           path: retroize-*-windows-x64.zip
           if-no-files-found: error
 
-      - name: Attach to release
-        if: startsWith(github.ref, 'refs/tags/v')
+      - name: Release
+        if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v'))
         uses: softprops/action-gh-release@v2
         with:
+          tag_name: ${{ steps.ver.outputs.tag }}
+          name: ${{ steps.ver.outputs.tag }}
           files: retroize-*-windows-x64.zip
-          draft: true
+          prerelease: ${{ !startsWith(github.ref, 'refs/tags/v') }}
+          draft: false
+          generate_release_notes: true
