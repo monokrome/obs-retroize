@@ -1,6 +1,5 @@
 /*
  * obs-retroize: video filter implementation
- * Copyright (c) 2026 Bailey 'monokrome' Stoner
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
@@ -8,38 +7,41 @@
 #include <graphics/vec2.h>
 #include <plugin-support.h>
 
-#define S_PRESET   "preset"
+#define S_FILTER   "filter_mode"
+#define S_STYLE    "style"
 #define S_TARGET_W "target_w"
 #define S_TARGET_H "target_h"
 #define S_BITS     "bits"
 #define S_DITHER   "dither"
 
+#define F_NEAREST "Nearest"
+#define F_BOX     "Box"
+#define BOX_TAPS_PER_AXIS 5
+
+#define P_CUSTOM  "Custom"
 #define P_NES     "NES"
 #define P_SNES    "SNES"
 #define P_GENESIS "Genesis"
 #define P_GAMEBOY "GameBoy"
-#define P_CUSTOM  "Custom"
 
-struct preset_def {
+struct style_def {
 	const char *id;
 	const char *technique;
 	int width;
 	int height;
 };
 
-static const struct preset_def presets[] = {
+static const struct style_def styles[] = {
+	{P_CUSTOM,  "Custom",  480, 270},
 	{P_NES,     "NES",     256, 240},
 	{P_SNES,    "SNES",    256, 224},
 	{P_GENESIS, "Genesis", 320, 224},
 	{P_GAMEBOY, "GameBoy", 160, 144},
-	{P_CUSTOM,  "Custom",  256, 240},
 };
-#define PRESET_COUNT (sizeof(presets) / sizeof(presets[0]))
+#define STYLE_COUNT (sizeof(styles) / sizeof(styles[0]))
 
 #define NES_PALETTE_COUNT 54
 
-// 64-entry NES 2C02-style palette as RGBA8. Black entries pad to 64 so the
-// shader can use a fixed loop bound; nes_count limits the effective range.
 static const uint8_t nes_palette_rgba[64 * 4] = {
 	 85, 85, 85,255,   0, 30,116,255,   7,  7,138,255,  59,  0,130,255,
 	103,  0, 88,255, 119,  0, 29,255, 107,  6,  0,255,  74, 29,  0,255,
@@ -62,7 +64,6 @@ static const uint8_t nes_palette_rgba[64 * 4] = {
 	154,232,232,255, 189,189,189,255,   0,  0,  0,255,   0,  0,  0,255
 };
 
-// 4x4 Bayer ordered-dither matrix as R8 in [0,255].
 static const uint8_t bayer_r8[16] = {
 	  0*16, 8*16, 2*16,10*16,
 	 12*16, 4*16,14*16, 6*16,
@@ -76,7 +77,8 @@ struct retroize_data {
 	gs_texture_t *nes_tex;
 	gs_texture_t *bayer_tex;
 
-	char *preset;
+	char *style;
+	char *filter_mode;
 	int   target_w;
 	int   target_h;
 	int   bits;
@@ -89,16 +91,18 @@ struct retroize_data {
 	gs_eparam_t *p_nes_palette;
 	gs_eparam_t *p_nes_count;
 	gs_eparam_t *p_bayer;
+	gs_eparam_t *p_filter_mode;
+	gs_eparam_t *p_box_samples;
 };
 
-static const struct preset_def *find_preset(const char *id)
+static const struct style_def *find_style(const char *id)
 {
-	if (!id) return &presets[0];
-	for (size_t i = 0; i < PRESET_COUNT; i++) {
-		if (strcmp(id, presets[i].id) == 0)
-			return &presets[i];
+	if (!id) return &styles[0];
+	for (size_t i = 0; i < STYLE_COUNT; i++) {
+		if (strcmp(id, styles[i].id) == 0)
+			return &styles[i];
 	}
-	return &presets[0];
+	return &styles[0];
 }
 
 static const char *retroize_get_name(void *unused)
@@ -111,28 +115,31 @@ static void retroize_update(void *data, obs_data_t *settings)
 {
 	struct retroize_data *f = data;
 
-	bfree(f->preset);
-	f->preset = bstrdup(obs_data_get_string(settings, S_PRESET));
-	f->target_w = (int)obs_data_get_int(settings, S_TARGET_W);
-	f->target_h = (int)obs_data_get_int(settings, S_TARGET_H);
-	f->bits     = (int)obs_data_get_int(settings, S_BITS);
-	f->dither   = obs_data_get_bool(settings, S_DITHER);
+	bfree(f->style);
+	bfree(f->filter_mode);
+	f->style       = bstrdup(obs_data_get_string(settings, S_STYLE));
+	f->filter_mode = bstrdup(obs_data_get_string(settings, S_FILTER));
+	f->target_w    = (int)obs_data_get_int(settings, S_TARGET_W);
+	f->target_h    = (int)obs_data_get_int(settings, S_TARGET_H);
+	f->bits        = (int)obs_data_get_int(settings, S_BITS);
+	f->dither      = obs_data_get_bool(settings, S_DITHER);
 }
 
 static void retroize_defaults(obs_data_t *settings)
 {
-	obs_data_set_default_string(settings, S_PRESET, P_NES);
-	obs_data_set_default_int(settings, S_TARGET_W, 256);
-	obs_data_set_default_int(settings, S_TARGET_H, 240);
+	obs_data_set_default_string(settings, S_FILTER, F_BOX);
+	obs_data_set_default_string(settings, S_STYLE, P_CUSTOM);
+	obs_data_set_default_int(settings, S_TARGET_W, 480);
+	obs_data_set_default_int(settings, S_TARGET_H, 270);
 	obs_data_set_default_int(settings, S_BITS, 4);
 	obs_data_set_default_bool(settings, S_DITHER, false);
 }
 
-static bool preset_modified(obs_properties_t *props, obs_property_t *p,
-			    obs_data_t *settings)
+static bool style_modified(obs_properties_t *props, obs_property_t *p,
+			   obs_data_t *settings)
 {
 	UNUSED_PARAMETER(p);
-	const char *id = obs_data_get_string(settings, S_PRESET);
+	const char *id = obs_data_get_string(settings, S_STYLE);
 	bool custom = (strcmp(id, P_CUSTOM) == 0);
 
 	obs_property_set_visible(obs_properties_get(props, S_TARGET_W), custom);
@@ -146,15 +153,21 @@ static obs_properties_t *retroize_properties(void *unused)
 	UNUSED_PARAMETER(unused);
 	obs_properties_t *props = obs_properties_create();
 
-	obs_property_t *preset = obs_properties_add_list(
-		props, S_PRESET, obs_module_text("Retroize.Preset"),
+	obs_property_t *filter = obs_properties_add_list(
+		props, S_FILTER, obs_module_text("Retroize.Filter"),
 		OBS_COMBO_TYPE_LIST, OBS_COMBO_FORMAT_STRING);
-	obs_property_list_add_string(preset, obs_module_text("Retroize.Preset.NES"),     P_NES);
-	obs_property_list_add_string(preset, obs_module_text("Retroize.Preset.SNES"),    P_SNES);
-	obs_property_list_add_string(preset, obs_module_text("Retroize.Preset.Genesis"), P_GENESIS);
-	obs_property_list_add_string(preset, obs_module_text("Retroize.Preset.GameBoy"), P_GAMEBOY);
-	obs_property_list_add_string(preset, obs_module_text("Retroize.Preset.Custom"),  P_CUSTOM);
-	obs_property_set_modified_callback(preset, preset_modified);
+	obs_property_list_add_string(filter, obs_module_text("Retroize.Filter.Box"),     F_BOX);
+	obs_property_list_add_string(filter, obs_module_text("Retroize.Filter.Nearest"), F_NEAREST);
+
+	obs_property_t *style = obs_properties_add_list(
+		props, S_STYLE, obs_module_text("Retroize.Style"),
+		OBS_COMBO_TYPE_LIST, OBS_COMBO_FORMAT_STRING);
+	obs_property_list_add_string(style, obs_module_text("Retroize.Style.Custom"),  P_CUSTOM);
+	obs_property_list_add_string(style, obs_module_text("Retroize.Style.NES"),     P_NES);
+	obs_property_list_add_string(style, obs_module_text("Retroize.Style.SNES"),    P_SNES);
+	obs_property_list_add_string(style, obs_module_text("Retroize.Style.Genesis"), P_GENESIS);
+	obs_property_list_add_string(style, obs_module_text("Retroize.Style.GameBoy"), P_GAMEBOY);
+	obs_property_set_modified_callback(style, style_modified);
 
 	obs_properties_add_int_slider(props, S_TARGET_W,
 		obs_module_text("Retroize.TargetWidth"), 16, 1920, 1);
@@ -175,7 +188,8 @@ static void retroize_destroy(void *data)
 	if (f->nes_tex)   gs_texture_destroy(f->nes_tex);
 	if (f->bayer_tex) gs_texture_destroy(f->bayer_tex);
 	obs_leave_graphics();
-	bfree(f->preset);
+	bfree(f->style);
+	bfree(f->filter_mode);
 	bfree(f);
 }
 
@@ -209,6 +223,8 @@ static void *retroize_create(obs_data_t *settings, obs_source_t *context)
 	f->p_nes_palette = gs_effect_get_param_by_name(f->effect, "nes_palette");
 	f->p_nes_count   = gs_effect_get_param_by_name(f->effect, "nes_count");
 	f->p_bayer       = gs_effect_get_param_by_name(f->effect, "bayer");
+	f->p_filter_mode = gs_effect_get_param_by_name(f->effect, "filter_mode");
+	f->p_box_samples = gs_effect_get_param_by_name(f->effect, "box_samples");
 
 	retroize_update(f, settings);
 	return f;
@@ -231,13 +247,15 @@ static void retroize_render(void *data, gs_effect_t *unused)
 		return;
 	}
 
-	const struct preset_def *p = find_preset(f->preset);
-	int tw = p->width;
-	int th = p->height;
-	if (strcmp(p->id, P_CUSTOM) == 0) {
+	const struct style_def *s = find_style(f->style);
+	int tw = s->width;
+	int th = s->height;
+	if (strcmp(s->id, P_CUSTOM) == 0) {
 		tw = f->target_w > 0 ? f->target_w : 1;
 		th = f->target_h > 0 ? f->target_h : 1;
 	}
+
+	float fmode = (f->filter_mode && strcmp(f->filter_mode, F_NEAREST) == 0) ? 0.0f : 1.0f;
 
 	if (!obs_source_process_filter_begin(f->context, GS_RGBA,
 					     OBS_ALLOW_DIRECT_RENDERING))
@@ -250,11 +268,13 @@ static void retroize_render(void *data, gs_effect_t *unused)
 	gs_effect_set_float(f->p_bits, (float)f->bits);
 	gs_effect_set_float(f->p_dither, f->dither ? 1.0f : 0.0f);
 	gs_effect_set_float(f->p_nes_count, (float)NES_PALETTE_COUNT);
+	gs_effect_set_float(f->p_filter_mode, fmode);
+	gs_effect_set_float(f->p_box_samples, (float)BOX_TAPS_PER_AXIS);
 	gs_effect_set_texture(f->p_nes_palette, f->nes_tex);
 	gs_effect_set_texture(f->p_bayer, f->bayer_tex);
 
 	obs_source_process_filter_tech_end(f->context, f->effect, w, h,
-					   p->technique);
+					   s->technique);
 }
 
 struct obs_source_info retroize_filter_info = {

@@ -1,17 +1,20 @@
 // obs-retroize: pixelize + palette/depth quantization
-// Copyright (c) 2026 Bailey 'monokrome' Stoner
 // SPDX-License-Identifier: BSD-2-Clause
 
 uniform float4x4 ViewProj;
 uniform texture2d image;
-uniform texture2d nes_palette;   // 64x1 RGBA, populated from C
-uniform texture2d bayer;         // 4x4 R8 (read .r), populated from C
+uniform texture2d nes_palette;
+uniform texture2d bayer;
 
 uniform float2 source_size;
 uniform float2 target_size;
 uniform float  bits_per_channel;
 uniform float  dither_strength;
-uniform float  nes_count;        // 54.0 -- unique entries to consider
+uniform float  nes_count;
+uniform float  filter_mode;   // 0 = nearest, 1 = box
+uniform float  box_samples;   // taps per axis when filter_mode == 1
+
+#define MAX_BOX 8
 
 sampler_state pointClamp {
     Filter   = Point;
@@ -45,12 +48,6 @@ float2 block_uv()
     return float2(scale, scale) / source_size;
 }
 
-float2 snap_uv(float2 uv)
-{
-    float2 b = block_uv();
-    return (floor(uv / b) + 0.5) * b;
-}
-
 float dither_offset(float2 uv)
 {
     if (dither_strength < 0.5) return 0.0;
@@ -65,9 +62,31 @@ float3 quantize_uniform(float3 c, float levels, float d)
     return floor(saturate(c + d / levels) * (levels - 1.0) + 0.5) / divisor;
 }
 
+// Sample a block's color: nearest = single center tap; box = NxN average.
 float3 sample_pixelated(float2 uv)
 {
-    return image.Sample(pointClamp, snap_uv(uv)).rgb;
+    float2 b = block_uv();
+    float2 origin = floor(uv / b) * b;
+
+    if (filter_mode < 0.5) {
+        return image.Sample(pointClamp, origin + b * 0.5).rgb;
+    }
+
+    int n = int(box_samples);
+    if (n < 1) n = 1;
+    if (n > MAX_BOX) n = MAX_BOX;
+    float inv_n = 1.0 / float(n);
+
+    float3 sum = float3(0.0, 0.0, 0.0);
+    for (int j = 0; j < MAX_BOX; j++) {
+        if (j >= n) break;
+        for (int i = 0; i < MAX_BOX; i++) {
+            if (i >= n) break;
+            float2 off = (float2(float(i), float(j)) + 0.5) * inv_n;
+            sum += image.Sample(pointClamp, origin + b * off).rgb;
+        }
+    }
+    return sum * (inv_n * inv_n);
 }
 
 float3 nearest_nes(float3 c)
